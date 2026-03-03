@@ -1,0 +1,8 @@
+.env
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+results_carousels.json
+scraped_ids.csv
