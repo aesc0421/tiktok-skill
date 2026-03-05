@@ -199,6 +199,12 @@ async def main():
                             if vid in seen_ids:
                                 skipped += 1
                                 continue
+                            carousel_preview = extract_carousel(video)
+                            if len(carousel_preview.get("photos", [])) > 8:
+                                skipped += 1
+                                seen_ids.add(vid)
+                                append_seen_ids([vid])
+                                continue
                             full_data = None
                             if fetch_full_info:
                                 try:
@@ -223,7 +229,7 @@ async def main():
                                 decision = _wait_for_decision(workspace)
                                 if decision == "feasible":
                                     print("  Feasible! Posting to influencer API...")
-                                    if _run_post_feasible(workspace):
+                                    if _post_to_influencer_webhook():
                                         print("  Done.")
                                     return
                                 if decision == "rejected":
@@ -262,7 +268,7 @@ async def main():
         decision = _wait_for_decision(workspace)
         if decision == "feasible":
             print("  Feasible! Posting to influencer API...")
-            if _run_post_feasible(workspace):
+            if _post_to_influencer_webhook():
                 print("  Done.")
             else:
                 print("  Failed to post.", file=sys.stderr)
@@ -330,29 +336,31 @@ def _wait_for_decision(workspace: Path, timeout: int = 1000) -> str | None:
     return None
 
 
-def _run_post_feasible(workspace: Path) -> bool:
-    """Run post_feasible.py. Returns True on success."""
-    script = workspace / "scripts" / "post_feasible.py"
-    if not script.exists():
-        print("  post_feasible.py not found", file=sys.stderr)
+def _post_to_influencer_webhook() -> bool:
+    """POST carousel JSON to influencer adaptation webhook. Returns True on success."""
+    url = os.environ.get("INFLUENCER_WEBHOOK_URL")
+    if not url:
+        print("  Influencer webhook: skipped (INFLUENCER_WEBHOOK_URL not set in .env)")
+        return False
+    timeout = int(os.environ.get("INFLUENCER_WEBHOOK_TIMEOUT", "60"))
+    if not OUTPUT_FILE.exists():
+        print("  No results_carousels.json to send.", file=sys.stderr)
         return False
     try:
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(workspace),
-            capture_output=True,
-            text=True,
-            timeout=30,
+        with open(OUTPUT_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        import urllib.request
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        if result.returncode == 0:
-            if result.stdout:
-                print(f"  {result.stdout.strip()}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            print(f"  Posted to influencer webhook (status {r.status})")
             return True
-        if result.stderr:
-            print(f"  {result.stderr.strip()}", file=sys.stderr)
-        return False
     except Exception as e:
-        print(f"  Failed to run post_feasible: {e}", file=sys.stderr)
+        print(f"  Failed to POST: {e}", file=sys.stderr)
         return False
 
 
@@ -366,7 +374,7 @@ if __name__ == "__main__":
         decision = _wait_for_decision(workspace)
         if decision == "feasible":
             print("  Feasible! Posting to influencer API...")
-            if _run_post_feasible(workspace):
+            if _post_to_influencer_webhook():
                 print("  Done.")
             else:
                 print("  Failed to post.", file=sys.stderr)
