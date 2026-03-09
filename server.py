@@ -27,11 +27,13 @@ def run_scraper(url: str):
 @app.route("/scrape", methods=["POST"])
 def scrape():
     data = request.get_json(silent=True) or {}
-    url = data.get("url") or request.form.get("url")
+    # JSON body, form, or Slack (sends URL in "text")
+    url = (data.get("url") or request.form.get("url") or request.form.get("text") or "").strip()
     if not url or "tiktok.com" not in url:
-        return jsonify({"error": "Missing or invalid url. Send JSON: {\"url\": \"https://...\"}"}), 400
+        return jsonify({"text": "Error: send a valid TikTok URL"}), 400
     threading.Thread(target=run_scraper, args=(url,), daemon=True).start()
-    return jsonify({"status": "accepted", "url": url}), 202
+    # 200 required by Slack; respond within 3s
+    return jsonify({"text": f"Processing carousel: {url[:50]}..."}), 200
 
 
 @app.route("/health", methods=["GET"])
