@@ -79,9 +79,9 @@ def download_images(carousel: dict) -> dict:
     return carousel
 
 
-def is_carousel(video) -> bool:
+def is_carousel(video=None, data=None) -> bool:
     """Check if post is a carousel/photo post (not video)."""
-    data = getattr(video, "as_dict", None) or {}
+    data = data if data is not None else (getattr(video, "as_dict", None) if video else {}) or {}
     # aweme_type 68 = photo post
     if data.get("aweme_type") == 68 or data.get("awemeType") == 68:
         return True
@@ -146,6 +146,70 @@ def extract_carousel(video, full_data=None) -> dict:
     return {"id": vid, "caption": caption, "song": song, "photos": photos, "author": author}
 
 
+def _parse_tiktok_url(url: str) -> tuple[str | None, str | None]:
+    """Extract username and video/photo ID from TikTok URL. Returns (username, vid) or (None, None)."""
+    import re
+    m = re.search(r"tiktok\.com/@([^/]+)/(?:video|photo)/(\d+)", url)
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+async def fetch_single_url(url: str):
+    """Fetch a single carousel from a TikTok URL."""
+    username, target_id = _parse_tiktok_url(url)
+    if not username or not target_id:
+        print("  Invalid TikTok URL. Expected: https://www.tiktok.com/@user/video/ID or .../photo/ID", file=sys.stderr)
+        return
+    ms_token = os.environ.get("ms_token")
+    headless = os.environ.get("TIKTOK_HEADLESS", "false").lower() == "true"
+    workspace = Path.home() / ".openclaw" / "workspace"
+    # video.info() fails for photo posts; use user.videos() to find by ID
+    video = None
+    async with TikTokApi() as api:
+        await api.create_sessions(
+            ms_tokens=[ms_token] if ms_token else [],
+            num_sessions=1,
+            sleep_after=3,
+            headless=headless,
+            browser=os.getenv("TIKTOK_BROWSER", "chromium"),
+        )
+        try:
+            async for v in api.user(username=username).videos(count=100):
+                data = getattr(v, "as_dict", None) or {}
+                vid = data.get("id") or getattr(v, "id", None) or ""
+                if str(vid) == str(target_id):
+                    video = v
+                    break
+        except Exception as e:
+            print(f"  Error fetching: {e}", file=sys.stderr)
+            return
+    if not video:
+        print(f"  Post {target_id} not found in @{username}'s recent videos.", file=sys.stderr)
+        return
+    data = getattr(video, "as_dict", None) or {}
+    if not is_carousel(data=data):
+        print("  Not a carousel/photo post.", file=sys.stderr)
+        return
+    carousel = extract_carousel(video, full_data=data)
+    if len(carousel.get("photos", [])) > 12:
+        print("  Carousel has more than 12 images, skipping.", file=sys.stderr)
+        return
+    carousel = download_images(carousel)
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump(carousel, f, indent=2)
+    print(f"  Carousel: {carousel['id']} from {url}")
+    _notify_openclaw()
+    print("  Waiting for agent decision...")
+    decision = _wait_for_decision(workspace)
+    if decision == "feasible":
+        print("  Feasible! Posting to influencer API...")
+        if _post_to_influencer_webhook():
+            print("  Done.")
+    elif decision == "rejected":
+        print("  Rejected.")
+    else:
+        print("  Timeout waiting for decision.", file=sys.stderr)
+
+
 async def main():
     config = load_config()
     profiles = config.get("profiles") or config.get("startUrls") or []
@@ -200,7 +264,7 @@ async def main():
                                 skipped += 1
                                 continue
                             carousel_preview = extract_carousel(video)
-                            if len(carousel_preview.get("photos", [])) > 8:
+                            if len(carousel_preview.get("photos", [])) > 12:
                                 skipped += 1
                                 seen_ids.add(vid)
                                 append_seen_ids([vid])
@@ -365,7 +429,14 @@ def _post_to_influencer_webhook() -> bool:
 
 
 if __name__ == "__main__":
-    if "--process-only" in sys.argv and OUTPUT_FILE.exists():
+    if "--url" in sys.argv:
+        i = sys.argv.index("--url")
+        if i + 1 < len(sys.argv):
+            url = sys.argv[i + 1]
+            asyncio.run(fetch_single_url(url))
+        else:
+            print("Usage: python scraper.py --url <tiktok_url>", file=sys.stderr)
+    elif "--process-only" in sys.argv and OUTPUT_FILE.exists():
         # Skip scraping; use existing results and notify OpenClaw
         print(f"Using existing {OUTPUT_FILE} (--process-only)")
         _notify_openclaw()
