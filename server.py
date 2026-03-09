@@ -5,6 +5,7 @@ POST /scrape with JSON: {"url": "https://www.tiktok.com/@user/photo/123"}
 """
 import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -39,6 +40,6 @@ def health():
 
 
 if __name__ == "__main__":
-    port = int(__import__("os").environ.get("SCRAPER_SERVER_PORT", "8080"))
-    print(f"Scraper server on http://0.0.0.0:{port}/scrape")
+    port = int(os.environ.get("SCRAPER_SERVER_PORT", "8080"))
+    print(f"Server on http://0.0.0.0:{port}/scrape")
     app.run(host="0.0.0.0", port=port)
