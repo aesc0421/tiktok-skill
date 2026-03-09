@@ -161,7 +161,7 @@ async def fetch_single_url(url: str):
         return
     ms_token = os.environ.get("ms_token")
     headless = os.environ.get("TIKTOK_HEADLESS", "false").lower() == "true"
-    workspace = Path.home() / ".openclaw" / "workspace"
+    workspace = _get_workspace()
     # video.info() fails for photo posts; use user.videos() to find by ID
     video = None
     async with TikTokApi() as api:
@@ -228,7 +228,7 @@ async def main():
     ms_token = os.environ.get("ms_token")  # optional: from tiktok.com cookies for fewer blocks
     headless = os.environ.get("TIKTOK_HEADLESS", "false").lower() == "true"
     loop_until_feasible = "--loop-until-feasible" in sys.argv
-    workspace = Path.home() / ".openclaw" / "workspace"
+    workspace = _get_workspace()
     max_attempts = 50 if loop_until_feasible else max_items
 
     seen_ids = load_seen_ids()
@@ -327,7 +327,7 @@ async def main():
     # Call OpenClaw (hosted locally) to process results
     _notify_openclaw()
     if results:
-        workspace = Path.home() / ".openclaw" / "workspace"
+        workspace = _get_workspace()
         print("  Waiting for agent decision...")
         decision = _wait_for_decision(workspace)
         if decision == "feasible":
@@ -342,6 +342,12 @@ async def main():
             print("  Timeout waiting for decision.", file=sys.stderr)
 
 
+def _get_workspace() -> Path:
+    """Workspace path. Set OPENCLAW_WORKSPACE_PATH for remote (e.g. mounted Mac mini)."""
+    p = os.environ.get("OPENCLAW_WORKSPACE_PATH", "").strip()
+    return Path(p) if p else Path.home() / ".openclaw" / "workspace"
+
+
 def _notify_openclaw():
     """POST to OpenClaw webhook so agent processes results_carousels.json."""
     url = os.environ.get("OPENCLAW_WEBHOOK_URL", "http://127.0.0.1:18789/hooks/agent")
@@ -352,7 +358,7 @@ def _notify_openclaw():
         return
     # OpenClaw agent uses ~/.openclaw/workspace; copy results there so it can find them
     import shutil
-    workspace = Path.home() / ".openclaw" / "workspace"
+    workspace = _get_workspace()
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "decision.txt").unlink(missing_ok=True)  # clear so we wait for fresh decision
     if OUTPUT_FILE.exists():
@@ -440,7 +446,7 @@ if __name__ == "__main__":
         # Skip scraping; use existing results and notify OpenClaw
         print(f"Using existing {OUTPUT_FILE} (--process-only)")
         _notify_openclaw()
-        workspace = Path.home() / ".openclaw" / "workspace"
+        workspace = _get_workspace()
         print("  Waiting for agent decision...")
         decision = _wait_for_decision(workspace)
         if decision == "feasible":
