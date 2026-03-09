@@ -8,9 +8,11 @@ import csv
 import json
 import os
 import random
+import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,10 +22,23 @@ from TikTokApi.exceptions import EmptyResponseException
 load_dotenv(Path(__file__).parent / ".env")
 
 # Config
-INPUT_FILE = Path(__file__).parent / "input.json"
-OUTPUT_FILE = Path(__file__).parent / "results_carousels.json"
-SEEN_IDS_FILE = Path(__file__).parent / "scraped_ids.csv"
-IMAGES_DIR = Path(__file__).parent / "images"
+SCRIPT_DIR = Path(__file__).parent
+INPUT_FILE = SCRIPT_DIR / "input.json"
+LOG_FILE = SCRIPT_DIR / "scraper.log"
+
+
+def _log(msg: str):
+    """Append to scraper.log for debugging when run from server."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+OUTPUT_FILE = SCRIPT_DIR / "results_carousels.json"
+SEEN_IDS_FILE = SCRIPT_DIR / "scraped_ids.csv"
+IMAGES_DIR = SCRIPT_DIR / "images"
 
 
 def load_seen_ids() -> set:
@@ -197,9 +212,12 @@ async def fetch_single_url(url: str):
     with open(OUTPUT_FILE, "w") as f:
         json.dump(carousel, f, indent=2)
     print(f"  Carousel: {carousel['id']} from {url}")
+    _log(f"Carousel {carousel['id']} scraped, notifying OpenClaw")
     _notify_openclaw()
     print("  Waiting for agent decision...")
+    _log(f"Waiting for decision at {workspace / 'decision.txt'}")
     decision = _wait_for_decision(workspace)
+    _log(f"Decision: {decision}")
     if decision == "feasible":
         print("  Feasible! Posting to influencer API...")
         if _post_to_influencer_webhook():
@@ -395,14 +413,23 @@ def _notify_openclaw():
 def _wait_for_decision(workspace: Path, timeout: int = 1000) -> str | None:
     """Poll for decision.txt. Returns 'feasible', 'rejected', or None."""
     decision_file = workspace / "decision.txt"
+    path_str = str(decision_file.resolve())
     start = time.time()
+    poll_count = 0
     while time.time() - start < timeout:
+        poll_count += 1
         if decision_file.exists():
             decision = decision_file.read_text(encoding="utf-8").strip().lower()
+            _log(f"Found decision.txt: {decision[:50]}")
             if decision.startswith("feasible"):
                 return "feasible"
             return "rejected"
+        if poll_count <= 3 or poll_count % 15 == 0:  # log first 3 and every 30s
+            print(f"  [poll {poll_count}] Waiting for {path_str}...", flush=True)
+            _log(f"Poll {poll_count}: waiting for {path_str}")
         time.sleep(2)
+    print(f"  Timeout after {poll_count} polls. Path: {path_str}", flush=True)
+    _log(f"Timeout after {poll_count} polls. Path: {path_str}")
     return None
 
 
@@ -418,15 +445,30 @@ def _post_to_influencer_webhook() -> bool:
         return False
     try:
         with open(OUTPUT_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        import urllib.request
+            carousel = json.load(f)
+        # Payload structure for influencer webhook
+        influencer_name = os.environ.get("INFLUENCER_NAME", "jimena")
+        payload = {
+            "id": carousel.get("id", ""),
+            "caption": carousel.get("caption", ""),
+            "influencerName": influencer_name,
+            "photos": [{"url": p.get("url", "")} for p in carousel.get("photos", [])],
+        }
+        # ngrok/self-signed: set SKIP_SSL_VERIFY=true in .env
+        if os.environ.get("SKIP_SSL_VERIFY", "").lower() in ("true", "1", "yes"):
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        else:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
         req = urllib.request.Request(
             url,
-            data=json.dumps(data).encode("utf-8"),
+            data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
             print(f"  Posted to influencer webhook (status {r.status})")
             return True
     except Exception as e:

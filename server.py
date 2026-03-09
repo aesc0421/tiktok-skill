@@ -21,7 +21,12 @@ app = Flask(__name__)
 
 
 def run_scraper(url: str):
-    asyncio.run(fetch_single_url(url))
+    try:
+        asyncio.run(fetch_single_url(url))
+    except Exception as e:
+        import traceback
+        print(f"Scraper error: {e}", flush=True)
+        traceback.print_exc()
 
 
 @app.route("/scrape", methods=["POST"])
