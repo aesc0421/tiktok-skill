@@ -176,7 +176,6 @@ async def fetch_single_url(url: str):
         return
     ms_token = os.environ.get("ms_token")
     headless = os.environ.get("TIKTOK_HEADLESS", "false").lower() == "true"
-    workspace = _get_workspace()
     # video.info() fails for photo posts; use user.videos() to find by ID
     video = None
     async with TikTokApi() as api:
@@ -212,20 +211,7 @@ async def fetch_single_url(url: str):
     with open(OUTPUT_FILE, "w") as f:
         json.dump(carousel, f, indent=2)
     print(f"  Carousel: {carousel['id']} from {url}")
-    _log(f"Carousel {carousel['id']} scraped, notifying OpenClaw")
-    _notify_openclaw()
-    print("  Waiting for agent decision...")
-    _log(f"Waiting for decision at {workspace / 'decision.txt'}")
-    decision = _wait_for_decision(workspace)
-    _log(f"Decision: {decision}")
-    if decision == "feasible":
-        print("  Feasible! Posting to influencer API...")
-        if _post_to_influencer_webhook():
-            print("  Done.")
-    elif decision == "rejected":
-        print("  Rejected.")
-    else:
-        print("  Timeout waiting for decision.", file=sys.stderr)
+    _log(f"Carousel {carousel['id']} scraped (--url mode, OpenClaw skipped)")
 
 
 async def main():
