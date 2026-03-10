@@ -14,6 +14,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 from TikTokApi import TikTokApi
@@ -161,7 +162,7 @@ def extract_carousel(video, full_data=None) -> dict:
     return {"id": vid, "caption": caption, "song": song, "photos": photos, "author": author}
 
 
-def _parse_tiktok_url(url: str) -> tuple[str | None, str | None]:
+def _parse_tiktok_url(url: str) -> tuple[Optional[str], Optional[str]]:
     """Extract username and video/photo ID from TikTok URL. Returns (username, vid) or (None, None)."""
     import re
     m = re.search(r"tiktok\.com/@([^/]+)/(?:video|photo)/(\d+)", url)
@@ -398,7 +399,7 @@ def _notify_openclaw():
         print(f"  Check OPENCLAW_WEBHOOK_URL ({url}) and that OpenClaw is running.", file=sys.stderr)
 
 
-def _wait_for_decision(workspace: Path, timeout: int = 1000) -> str | None:
+def _wait_for_decision(workspace: Path, timeout: int = 1000) -> Optional[str]:
     """Poll for decision.txt. Returns 'feasible', 'rejected', or None."""
     decision_file = workspace / "decision.txt"
     path_str = str(decision_file.resolve())
