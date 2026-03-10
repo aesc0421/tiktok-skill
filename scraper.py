@@ -212,6 +212,8 @@ async def fetch_single_url(url: str):
         json.dump(carousel, f, indent=2)
     print(f"  Carousel: {carousel['id']} from {url}")
     _log(f"Carousel {carousel['id']} scraped (--url mode, OpenClaw skipped)")
+    if _post_to_influencer_webhook():
+        print("  Posted to influencer webhook.")
 
 
 async def main():
