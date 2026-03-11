@@ -25,7 +25,11 @@ load_dotenv(Path(__file__).parent / ".env")
 # Config
 SCRIPT_DIR = Path(__file__).parent
 INPUT_FILE = SCRIPT_DIR / "input.json"
+INPUT_RECIPES_FILE = SCRIPT_DIR / "input_recipes.json"
 LOG_FILE = SCRIPT_DIR / "scraper.log"
+
+# Mode: "recipes" if --mode recipes or --recipes, else "nutrition"
+MODE = "recipes" if ("--mode" in sys.argv and "recipes" in sys.argv) or "--recipes" in sys.argv else "nutrition"
 
 
 def _log(msg: str):
@@ -62,7 +66,12 @@ def append_seen_ids(ids: list[str]):
 
 
 def load_config():
-    with open(INPUT_FILE) as f:
+    """Load config from input.json (nutrition) or input_recipes.json (recipes mode)."""
+    path = INPUT_RECIPES_FILE if MODE == "recipes" else INPUT_FILE
+    if MODE == "recipes" and not path.exists():
+        print(f"  Warning: {path.name} not found, falling back to {INPUT_FILE.name}", file=sys.stderr)
+        path = INPUT_FILE
+    with open(path) as f:
         return json.load(f)
 
 
@@ -169,7 +178,7 @@ def _parse_tiktok_url(url: str) -> tuple[Optional[str], Optional[str]]:
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
-async def fetch_single_url(url: str):
+async def fetch_single_url(url: str, mode: str = "nutrition"):
     """Fetch a single carousel from a TikTok URL."""
     username, target_id = _parse_tiktok_url(url)
     if not username or not target_id:
@@ -212,8 +221,10 @@ async def fetch_single_url(url: str):
     with open(OUTPUT_FILE, "w") as f:
         json.dump(carousel, f, indent=2)
     print(f"  Carousel: {carousel['id']} from {url}")
-    _log(f"Carousel {carousel['id']} scraped (--url mode, OpenClaw skipped)")
-    if _post_to_influencer_webhook():
+    _log(f"Carousel {carousel['id']} scraped (--url mode)")
+    if mode == "recipes":
+        _notify_wait_and_post("recipes")
+    elif _post_to_webhook("influencer"):
         print("  Posted to influencer webhook.")
     else:
         path = _save_to_failed_queue()
@@ -238,7 +249,7 @@ async def main():
 
     ms_token = os.environ.get("ms_token")  # optional: from tiktok.com cookies for fewer blocks
     headless = os.environ.get("TIKTOK_HEADLESS", "false").lower() == "true"
-    loop_until_feasible = "--loop-until-feasible" in sys.argv
+    loop_until_feasible = "--loop-until-feasible" in sys.argv or MODE == "recipes"
     workspace = _get_workspace()
     max_attempts = 50 if loop_until_feasible else max_items
 
@@ -257,6 +268,8 @@ async def main():
         for source_type, source_name in sources:
             if len(results) >= max_attempts:
                 break
+            src_label = f"#{source_name}" if source_type == "hashtag" else f"@{source_name}"
+            print(f"  Searching {src_label}...")
             for attempt in range(3):
                 try:
                     if source_type == "profile":
@@ -299,32 +312,28 @@ async def main():
                             src = f"#{source_name}" if source_type == "hashtag" else f"@{source_name}"
                             print(f"  Carousel: {carousel['id']} from {src} ({len(results)}/{max_attempts})")
                             if loop_until_feasible:
-                                _notify_openclaw()
-                                print("  Waiting for agent decision...")
-                                decision = _wait_for_decision(workspace)
+                                decision = _notify_wait_and_post(MODE)
                                 if decision == "feasible":
-                                    print("  Feasible! Posting to influencer API...")
-                                    if _post_to_influencer_webhook():
-                                        print("  Done.")
-                                    else:
-                                        path = _save_to_failed_queue()
-                                        _log(f"Failed to post, saved to queue/{path.name}")
-                                        print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
                                     return
                                 if decision == "rejected":
                                     results.pop()
                                     print("  Rejected, trying next carousel...")
                                 else:
-                                    print("  Timeout waiting for decision, stopping.", file=sys.stderr)
                                     return
                     break
-                except EmptyResponseException as e:
-                    if attempt < 2:
-                        wait = (attempt + 1) * 10
-                        print(f"  TikTok blocked (attempt {attempt + 1}/3). Waiting {wait}s...", file=sys.stderr)
-                        await asyncio.sleep(wait)
+                except (KeyError, EmptyResponseException) as e:
+                    if isinstance(e, EmptyResponseException):
+                        if attempt < 2:
+                            wait = (attempt + 1) * 10
+                            print(f"  TikTok blocked (attempt {attempt + 1}/3). Waiting {wait}s...", file=sys.stderr)
+                            await asyncio.sleep(wait)
+                        else:
+                            raise
                     else:
-                        raise
+                        # KeyError: perfil/hashtag inexistente o respuesta inesperada de TikTok
+                        src = f"#{source_name}" if source_type == "hashtag" else f"@{source_name}"
+                        print(f"  Skipping {src}: {e}", file=sys.stderr)
+                        break
 
     if results:
         with open(OUTPUT_FILE, "w") as f:
@@ -340,23 +349,8 @@ async def main():
         return
 
     # Call OpenClaw (hosted locally) to process results
-    _notify_openclaw()
     if results:
-        workspace = _get_workspace()
-        print("  Waiting for agent decision...")
-        decision = _wait_for_decision(workspace)
-        if decision == "feasible":
-            print("  Feasible! Posting to influencer API...")
-            if _post_to_influencer_webhook():
-                print("  Done.")
-            else:
-                path = _save_to_failed_queue()
-                _log(f"Failed to post, saved to queue/{path.name}")
-                print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
-        elif decision == "rejected":
-            print("  Rejected.")
-        else:
-            print("  Timeout waiting for decision.", file=sys.stderr)
+        _notify_wait_and_post(MODE)
 
 
 def _get_workspace() -> Path:
@@ -365,8 +359,9 @@ def _get_workspace() -> Path:
     return Path(p).expanduser() if p else Path.home() / ".openclaw" / "workspace"
 
 
-def _notify_openclaw():
+def _notify_openclaw(mode: Optional[str] = None):
     """POST to OpenClaw webhook so agent processes results_carousels.json."""
+    mode = mode or MODE
     url = os.environ.get("OPENCLAW_WEBHOOK_URL", "http://127.0.0.1:18789/hooks/agent")
     token = os.environ.get("OPENCLAW_TOKEN", "")
     timeout = int(os.environ.get("OPENCLAW_WEBHOOK_TIMEOUT", "120"))
@@ -380,6 +375,8 @@ def _notify_openclaw():
     workspace = _get_workspace()
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "decision.txt").unlink(missing_ok=True)  # clear so we wait for fresh decision
+    if mode == "recipes":
+        (workspace / "recipe.txt").unlink(missing_ok=True)  # clear previous recipe before new run
     if OUTPUT_FILE.exists():
         shutil.copy2(OUTPUT_FILE, workspace / OUTPUT_FILE.name)
         print(f"  Copied {OUTPUT_FILE.name} to OpenClaw workspace")
@@ -389,12 +386,16 @@ def _notify_openclaw():
             shutil.rmtree(dest)
         shutil.copytree(IMAGES_DIR, dest)
         print(f"  Copied images/ to OpenClaw workspace")
+    if mode == "recipes":
+        message = "extract-recipe: run extract-recipe skill on results_carousels.json, analyze each image, if viable recipe extract to recipe.txt and write feasible to decision.txt, else write rejected to decision.txt."
+    else:
+        message = "Follow AGENTS.md: process results_carousels.json, analyze each image in photos[], decide if feasible for nutrition influencer account, write decision to decision.txt."
     try:
         import urllib.request
         req = urllib.request.Request(
             url,
             data=json.dumps({
-                "message": "Follow AGENTS.md: process results_carousels.json, analyze each image in photos[], decide if feasible for nutrition influencer account, write decision to decision.txt.",
+                "message": message,
                 "wakeMode": "now",
                 "allowUnsafeExternalContent": True,
             }).encode(),
@@ -411,6 +412,28 @@ def _notify_openclaw():
         _log(f"OpenClaw notify FAILED: {e}")
         print(f"  Warning: could not notify OpenClaw: {e}", file=sys.stderr)
         print(f"  Check OPENCLAW_WEBHOOK_URL ({url}) and that OpenClaw is running.", file=sys.stderr)
+
+
+def _notify_wait_and_post(mode: str) -> Optional[str]:
+    """Notify OpenClaw, wait for decision, post to webhook if feasible. Returns decision."""
+    workspace = _get_workspace()
+    _notify_openclaw(mode)
+    print("  Waiting for agent decision...")
+    decision = _wait_for_decision(workspace)
+    if decision == "feasible":
+        api_name = "recipes API" if mode == "recipes" else "influencer API"
+        print(f"  Feasible! Posting to {api_name}...")
+        if _post_to_webhook(mode):
+            print("  Done.")
+        else:
+            path = _save_to_failed_queue()
+            _log(f"Failed to post, saved to queue/{path.name}")
+            print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
+    elif decision == "rejected":
+        print("  Rejected.")
+    else:
+        print("  Timeout waiting for decision.", file=sys.stderr)
+    return decision
 
 
 def _wait_for_decision(workspace: Path, timeout: int = 1000) -> Optional[str]:
@@ -449,29 +472,39 @@ def _save_to_failed_queue() -> Path:
     return path
 
 
-def _post_to_influencer_webhook() -> bool:
-    """POST carousel JSON to influencer adaptation webhook. Returns True on success."""
-    url = os.environ.get("INFLUENCER_WEBHOOK_URL")
+def _post_to_webhook(mode: str = "influencer") -> bool:
+    """POST carousel to influencer or recipes webhook. Returns True on success."""
+    if mode == "recipes":
+        url = os.environ.get("RECIPES_WEBHOOK_URL")
+        timeout = int(os.environ.get("RECIPES_WEBHOOK_TIMEOUT", "60"))
+        log_name = "Recipes webhook"
+    else:
+        url = os.environ.get("INFLUENCER_WEBHOOK_URL")
+        timeout = int(os.environ.get("INFLUENCER_WEBHOOK_TIMEOUT", "60"))
+        log_name = "Influencer webhook"
     if not url:
-        _log("Influencer webhook: skipped (INFLUENCER_WEBHOOK_URL not set in .env)")
-        print("  Influencer webhook: skipped (INFLUENCER_WEBHOOK_URL not set in .env)")
+        _log(f"{log_name}: skipped (URL not set in .env)")
+        print(f"  {log_name}: skipped (URL not set in .env)")
         return False
-    timeout = int(os.environ.get("INFLUENCER_WEBHOOK_TIMEOUT", "60"))
     if not OUTPUT_FILE.exists():
-        _log("Influencer webhook: no results_carousels.json to send")
+        _log(f"{log_name}: no results_carousels.json to send")
         print("  No results_carousels.json to send.", file=sys.stderr)
         return False
     try:
         with open(OUTPUT_FILE, encoding="utf-8") as f:
             carousel = json.load(f)
-        # Payload structure for influencer webhook
-        influencer_name = os.environ.get("INFLUENCER_NAME", "jimena")
-        payload = {
+        base_payload = {
             "id": carousel.get("id", ""),
             "caption": carousel.get("caption", ""),
-            "influencerName": influencer_name,
             "photos": [{"url": p.get("url", "")} for p in carousel.get("photos", [])],
         }
+        if mode == "recipes":
+            workspace = _get_workspace()
+            recipe_path = workspace / "recipe.txt"
+            recipe_text = recipe_path.read_text(encoding="utf-8") if recipe_path.exists() else ""
+            payload = {**base_payload, "recipe": recipe_text}
+        else:
+            payload = {**base_payload, "influencerName": os.environ.get("INFLUENCER_NAME", "jimena")}
         # ngrok/self-signed: set SKIP_SSL_VERIFY=true in .env
         if os.environ.get("SKIP_SSL_VERIFY", "").lower() in ("true", "1", "yes"):
             ctx = ssl.create_default_context()
@@ -487,11 +520,11 @@ def _post_to_influencer_webhook() -> bool:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-            _log(f"Posted to influencer webhook (status {r.status})")
-            print(f"  Posted to influencer webhook (status {r.status})")
+            _log(f"Posted to {log_name.lower()} (status {r.status})")
+            print(f"  Posted to {log_name.lower()} (status {r.status})")
             return True
     except Exception as e:
-        _log(f"Failed to POST to influencer: {e}")
+        _log(f"Failed to POST to {log_name.lower()}: {e}")
         print(f"  Failed to POST: {e}", file=sys.stderr)
         return False
 
@@ -501,28 +534,12 @@ if __name__ == "__main__":
         i = sys.argv.index("--url")
         if i + 1 < len(sys.argv):
             url = sys.argv[i + 1]
-            asyncio.run(fetch_single_url(url))
+            asyncio.run(fetch_single_url(url, mode=MODE))
         else:
             print("Usage: python scraper.py --url <tiktok_url>", file=sys.stderr)
     elif "--process-only" in sys.argv and OUTPUT_FILE.exists():
-        # Skip scraping; use existing results and notify OpenClaw
         print(f"Using existing {OUTPUT_FILE} (--process-only)")
-        _notify_openclaw()
-        workspace = _get_workspace()
-        print("  Waiting for agent decision...")
-        decision = _wait_for_decision(workspace)
-        if decision == "feasible":
-            print("  Feasible! Posting to influencer API...")
-            if _post_to_influencer_webhook():
-                print("  Done.")
-            else:
-                path = _save_to_failed_queue()
-                _log(f"Failed to post, saved to queue/{path.name}")
-                print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
-        elif decision == "rejected":
-            print("  Rejected. Run scraper without --process-only to try another post.")
-        else:
-            print("  Timeout waiting for decision.", file=sys.stderr)
+        _notify_wait_and_post(MODE)
     elif "--init-seen" in sys.argv and OUTPUT_FILE.exists():
         # Bootstrap scraped_ids.csv from existing results_carousels.json
         with open(OUTPUT_FILE) as f:
