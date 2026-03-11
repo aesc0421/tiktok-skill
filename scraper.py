@@ -215,6 +215,10 @@ async def fetch_single_url(url: str):
     _log(f"Carousel {carousel['id']} scraped (--url mode, OpenClaw skipped)")
     if _post_to_influencer_webhook():
         print("  Posted to influencer webhook.")
+    else:
+        path = _save_to_failed_queue()
+        _log(f"Failed to post, saved to queue/{path.name}")
+        print(f"  Failed to post, saved to {path} for retry")
 
 
 async def main():
@@ -302,6 +306,10 @@ async def main():
                                     print("  Feasible! Posting to influencer API...")
                                     if _post_to_influencer_webhook():
                                         print("  Done.")
+                                    else:
+                                        path = _save_to_failed_queue()
+                                        _log(f"Failed to post, saved to queue/{path.name}")
+                                        print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
                                     return
                                 if decision == "rejected":
                                     results.pop()
@@ -342,7 +350,9 @@ async def main():
             if _post_to_influencer_webhook():
                 print("  Done.")
             else:
-                print("  Failed to post.", file=sys.stderr)
+                path = _save_to_failed_queue()
+                _log(f"Failed to post, saved to queue/{path.name}")
+                print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
         elif decision == "rejected":
             print("  Rejected.")
         else:
@@ -352,7 +362,7 @@ async def main():
 def _get_workspace() -> Path:
     """Workspace path. Set OPENCLAW_WORKSPACE_PATH for remote (e.g. mounted Mac mini)."""
     p = os.environ.get("OPENCLAW_WORKSPACE_PATH", "").strip()
-    return Path(p) if p else Path.home() / ".openclaw" / "workspace"
+    return Path(p).expanduser() if p else Path.home() / ".openclaw" / "workspace"
 
 
 def _notify_openclaw():
@@ -361,8 +371,10 @@ def _notify_openclaw():
     token = os.environ.get("OPENCLAW_TOKEN", "")
     timeout = int(os.environ.get("OPENCLAW_WEBHOOK_TIMEOUT", "120"))
     if not token:
+        _log("OpenClaw: skipped (OPENCLAW_TOKEN not set in .env)")
         print("  OpenClaw: skipped (OPENCLAW_TOKEN not set in .env)")
         return
+    _log(f"OpenClaw: notifying {url}")
     # OpenClaw agent uses ~/.openclaw/workspace; copy results there so it can find them
     import shutil
     workspace = _get_workspace()
@@ -393,8 +405,10 @@ def _notify_openclaw():
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
+            _log(f"Notified OpenClaw (status {r.status})")
             print(f"  Notified OpenClaw (status {r.status})")
     except Exception as e:
+        _log(f"OpenClaw notify FAILED: {e}")
         print(f"  Warning: could not notify OpenClaw: {e}", file=sys.stderr)
         print(f"  Check OPENCLAW_WEBHOOK_URL ({url}) and that OpenClaw is running.", file=sys.stderr)
 
@@ -422,14 +436,29 @@ def _wait_for_decision(workspace: Path, timeout: int = 1000) -> Optional[str]:
     return None
 
 
+def _save_to_failed_queue() -> Path:
+    """Save carousel from OUTPUT_FILE to queue/failed_*.json when POST fails. Returns path."""
+    queue_dir = SCRIPT_DIR / "queue"
+    queue_dir.mkdir(exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = queue_dir / f"failed_{ts}.json"
+    with open(OUTPUT_FILE, encoding="utf-8") as f:
+        carousel = json.load(f)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(carousel, f, indent=2)
+    return path
+
+
 def _post_to_influencer_webhook() -> bool:
     """POST carousel JSON to influencer adaptation webhook. Returns True on success."""
     url = os.environ.get("INFLUENCER_WEBHOOK_URL")
     if not url:
+        _log("Influencer webhook: skipped (INFLUENCER_WEBHOOK_URL not set in .env)")
         print("  Influencer webhook: skipped (INFLUENCER_WEBHOOK_URL not set in .env)")
         return False
     timeout = int(os.environ.get("INFLUENCER_WEBHOOK_TIMEOUT", "60"))
     if not OUTPUT_FILE.exists():
+        _log("Influencer webhook: no results_carousels.json to send")
         print("  No results_carousels.json to send.", file=sys.stderr)
         return False
     try:
@@ -458,9 +487,11 @@ def _post_to_influencer_webhook() -> bool:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            _log(f"Posted to influencer webhook (status {r.status})")
             print(f"  Posted to influencer webhook (status {r.status})")
             return True
     except Exception as e:
+        _log(f"Failed to POST to influencer: {e}")
         print(f"  Failed to POST: {e}", file=sys.stderr)
         return False
 
@@ -485,7 +516,9 @@ if __name__ == "__main__":
             if _post_to_influencer_webhook():
                 print("  Done.")
             else:
-                print("  Failed to post.", file=sys.stderr)
+                path = _save_to_failed_queue()
+                _log(f"Failed to post, saved to queue/{path.name}")
+                print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
         elif decision == "rejected":
             print("  Rejected. Run scraper without --process-only to try another post.")
         else:
