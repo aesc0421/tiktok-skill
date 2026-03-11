@@ -44,6 +44,8 @@ def _log(msg: str):
 OUTPUT_FILE = SCRIPT_DIR / "results_carousels.json"
 SEEN_IDS_FILE = SCRIPT_DIR / "scraped_ids.csv"
 IMAGES_DIR = SCRIPT_DIR / "images"
+LOCK_FILE = SCRIPT_DIR / "scraper.lock"
+QUEUE_DIR = SCRIPT_DIR / "queue"
 
 
 def load_seen_ids() -> set:
@@ -63,6 +65,63 @@ def append_seen_ids(ids: list[str]):
         w = csv.writer(f)
         for vid in ids:
             w.writerow([vid])
+
+
+def _is_locked() -> bool:
+    """True if lock exists and the PID inside is a running process."""
+    if not LOCK_FILE.exists():
+        return False
+    try:
+        pid = int(LOCK_FILE.read_text().strip())
+        os.kill(pid, 0)  # Check if process exists (raises if not)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _acquire_lock() -> bool:
+    """Create lock file with current PID. Returns True if acquired."""
+    LOCK_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_lock():
+    """Remove lock file."""
+    LOCK_FILE.unlink(missing_ok=True)
+
+
+def _enqueue(mode: str) -> Path:
+    """Save current carousel + images to queue. Returns path to queued item."""
+    import shutil
+    QUEUE_DIR.mkdir(exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    item_dir = QUEUE_DIR / f"pending_{ts}_{mode}"
+    item_dir.mkdir()
+    if OUTPUT_FILE.exists():
+        shutil.copy2(OUTPUT_FILE, item_dir / "results_carousels.json")
+    if IMAGES_DIR.exists():
+        shutil.copytree(IMAGES_DIR, item_dir / "images")
+    (item_dir / "mode.txt").write_text(mode)
+    return item_dir
+
+
+def _dequeue() -> Optional[tuple[Path, str]]:
+    """Get next item from queue. Returns (item_dir, mode) or None."""
+    if not QUEUE_DIR.exists():
+        return None
+    pending = sorted(QUEUE_DIR.glob("pending_*"))
+    if not pending:
+        return None
+    item_dir = pending[0]
+    mode_file = item_dir / "mode.txt"
+    mode = mode_file.read_text().strip() if mode_file.exists() else "nutrition"
+    return (item_dir, mode)
+
+
+def _remove_from_queue(item_dir: Path):
+    """Remove processed item from queue."""
+    import shutil
+    shutil.rmtree(item_dir, ignore_errors=True)
 
 
 def load_config():
@@ -214,16 +273,13 @@ async def fetch_single_url(url: str, mode: str = "nutrition"):
         print("  Not a carousel/photo post.", file=sys.stderr)
         return
     carousel = extract_carousel(video, full_data=data)
-    if len(carousel.get("photos", [])) > 12:
-        print("  Carousel has more than 12 images, skipping.", file=sys.stderr)
-        return
     carousel = download_images(carousel)
     with open(OUTPUT_FILE, "w") as f:
         json.dump(carousel, f, indent=2)
     print(f"  Carousel: {carousel['id']} from {url}")
     _log(f"Carousel {carousel['id']} scraped (--url mode)")
     if mode == "recipes":
-        _notify_wait_and_post("recipes")
+        _process_with_lock("recipes")
     elif _post_to_webhook("influencer"):
         print("  Posted to influencer webhook.")
     else:
@@ -287,12 +343,6 @@ async def main():
                             if vid in seen_ids:
                                 skipped += 1
                                 continue
-                            carousel_preview = extract_carousel(video)
-                            if len(carousel_preview.get("photos", [])) > 12:
-                                skipped += 1
-                                seen_ids.add(vid)
-                                append_seen_ids([vid])
-                                continue
                             full_data = None
                             if fetch_full_info:
                                 try:
@@ -312,7 +362,9 @@ async def main():
                             src = f"#{source_name}" if source_type == "hashtag" else f"@{source_name}"
                             print(f"  Carousel: {carousel['id']} from {src} ({len(results)}/{max_attempts})")
                             if loop_until_feasible:
-                                decision = _notify_wait_and_post(MODE)
+                                decision = _process_with_lock(MODE)
+                                if decision is None:
+                                    return  # queued, exit
                                 if decision == "feasible":
                                     return
                                 if decision == "rejected":
@@ -350,7 +402,7 @@ async def main():
 
     # Call OpenClaw (hosted locally) to process results
     if results:
-        _notify_wait_and_post(MODE)
+        _process_with_lock(MODE)
 
 
 def _get_workspace() -> Path:
@@ -414,6 +466,19 @@ def _notify_openclaw(mode: Optional[str] = None):
         print(f"  Check OPENCLAW_WEBHOOK_URL ({url}) and that OpenClaw is running.", file=sys.stderr)
 
 
+def _load_from_queue_item(item_dir: Path):
+    """Copy queued item to OUTPUT_FILE and IMAGES_DIR for processing."""
+    import shutil
+    src_json = item_dir / "results_carousels.json"
+    src_images = item_dir / "images"
+    if src_json.exists():
+        shutil.copy2(src_json, OUTPUT_FILE)
+    if src_images.exists():
+        if IMAGES_DIR.exists():
+            shutil.rmtree(IMAGES_DIR)
+        shutil.copytree(src_images, IMAGES_DIR)
+
+
 def _notify_wait_and_post(mode: str) -> Optional[str]:
     """Notify OpenClaw, wait for decision, post to webhook if feasible. Returns decision."""
     workspace = _get_workspace()
@@ -434,6 +499,31 @@ def _notify_wait_and_post(mode: str) -> Optional[str]:
     else:
         print("  Timeout waiting for decision.", file=sys.stderr)
     return decision
+
+
+def _process_with_lock(mode: str) -> Optional[str]:
+    """Process current carousel (or queue if locked). If locked, enqueue and return None. Else process and drain queue."""
+    if _is_locked():
+        path = _enqueue(mode)
+        print(f"  OpenClaw busy. Queued for later: {path.name}")
+        _log(f"Queued: {path.name} (mode={mode})")
+        return None
+    _acquire_lock()
+    try:
+        decision = _notify_wait_and_post(mode)
+        # Procesar cola pendiente
+        while True:
+            next_item = _dequeue()
+            if not next_item:
+                break
+            item_dir, item_mode = next_item
+            print(f"  Processing queued item: {item_dir.name}")
+            _load_from_queue_item(item_dir)
+            _notify_wait_and_post(item_mode)
+            _remove_from_queue(item_dir)
+        return decision
+    finally:
+        _release_lock()
 
 
 def _wait_for_decision(workspace: Path, timeout: int = 1000) -> Optional[str]:
@@ -493,18 +583,21 @@ def _post_to_webhook(mode: str = "influencer") -> bool:
     try:
         with open(OUTPUT_FILE, encoding="utf-8") as f:
             carousel = json.load(f)
-        base_payload = {
+        influencer_name = (
+            (carousel.get("author") or {}).get("username")
+            or os.environ.get("INFLUENCER_NAME", "jimena")
+        )
+        payload = {
             "id": carousel.get("id", ""),
             "caption": carousel.get("caption", ""),
+            "influencerName": influencer_name,
             "photos": [{"url": p.get("url", "")} for p in carousel.get("photos", [])],
         }
         if mode == "recipes":
             workspace = _get_workspace()
             recipe_path = workspace / "recipe.txt"
-            recipe_text = recipe_path.read_text(encoding="utf-8") if recipe_path.exists() else ""
-            payload = {**base_payload, "recipe": recipe_text}
-        else:
-            payload = {**base_payload, "influencerName": os.environ.get("INFLUENCER_NAME", "jimena")}
+            if recipe_path.exists():
+                payload["recipe"] = recipe_path.read_text(encoding="utf-8")
         # ngrok/self-signed: set SKIP_SSL_VERIFY=true in .env
         if os.environ.get("SKIP_SSL_VERIFY", "").lower() in ("true", "1", "yes"):
             ctx = ssl.create_default_context()
@@ -539,7 +632,7 @@ if __name__ == "__main__":
             print("Usage: python scraper.py --url <tiktok_url>", file=sys.stderr)
     elif "--process-only" in sys.argv and OUTPUT_FILE.exists():
         print(f"Using existing {OUTPUT_FILE} (--process-only)")
-        _notify_wait_and_post(MODE)
+        _process_with_lock(MODE)
     elif "--init-seen" in sys.argv and OUTPUT_FILE.exists():
         # Bootstrap scraped_ids.csv from existing results_carousels.json
         with open(OUTPUT_FILE) as f:
