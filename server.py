@@ -20,25 +20,32 @@ from scraper import fetch_single_url
 app = Flask(__name__)
 
 
-def run_scraper(url: str):
+def run_scraper(url: str, mode: str = "nutrition", skip_decision: bool = False):
     try:
-        asyncio.run(fetch_single_url(url))
+        asyncio.run(fetch_single_url(url, mode=mode, skip_decision=skip_decision))
     except Exception as e:
         import traceback
         print(f"Scraper error: {e}", flush=True)
         traceback.print_exc()
 
 
-@app.route("/scrape", methods=["POST"])
-def scrape():
+def _scrape(mode: str, skip_decision: bool = False):
     data = request.get_json(silent=True) or {}
-    # JSON body, form, or Slack (sends URL in "text")
     url = (data.get("url") or request.form.get("url") or request.form.get("text") or "").strip()
     if not url or "tiktok.com" not in url:
         return jsonify({"text": "Error: send a valid TikTok URL"}), 400
-    threading.Thread(target=run_scraper, args=(url,), daemon=True).start()
-    # 200 required by Slack; respond within 3s
-    return jsonify({"text": f"Processing carousel: {url}"}), 200
+    threading.Thread(target=run_scraper, args=(url, mode, skip_decision), daemon=True).start()
+    return jsonify({"text": f"Processing: {url}"}), 200
+
+
+@app.route("/scrape", methods=["POST"])
+def scrape():
+    return _scrape("nutrition")
+
+
+@app.route("/scrape-recipes", methods=["POST"])
+def scrape_recipes():
+    return _scrape("recipes", skip_decision=True)
 
 
 @app.route("/health", methods=["GET"])

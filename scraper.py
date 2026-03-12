@@ -46,6 +46,7 @@ SEEN_IDS_FILE = SCRIPT_DIR / "scraped_ids.csv"
 IMAGES_DIR = SCRIPT_DIR / "images"
 LOCK_FILE = SCRIPT_DIR / "scraper.lock"
 QUEUE_DIR = SCRIPT_DIR / "queue"
+MAX_POSTS_PER_RUN = 2
 
 
 def load_seen_ids() -> set:
@@ -237,7 +238,7 @@ def _parse_tiktok_url(url: str) -> tuple[Optional[str], Optional[str]]:
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
-async def fetch_single_url(url: str, mode: str = "nutrition"):
+async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: bool = False):
     """Fetch a single carousel from a TikTok URL."""
     username, target_id = _parse_tiktok_url(url)
     if not username or not target_id:
@@ -278,7 +279,18 @@ async def fetch_single_url(url: str, mode: str = "nutrition"):
         json.dump(carousel, f, indent=2)
     print(f"  Carousel: {carousel['id']} from {url}")
     _log(f"Carousel {carousel['id']} scraped (--url mode)")
-    if mode == "recipes":
+    if mode == "recipes" and skip_decision:
+        # Endpoint flow: get recipe from OpenClaw, post directly (no decision)
+        if _is_locked():
+            path = _enqueue("recipes")
+            print(f"  OpenClaw busy. Queued: {path.name}")
+            return
+        _acquire_lock()
+        try:
+            _notify_wait_recipe_and_post()
+        finally:
+            _release_lock()
+    elif mode == "recipes":
         _process_with_lock("recipes")
     elif _post_to_webhook("influencer"):
         print("  Posted to influencer webhook.")
@@ -321,6 +333,7 @@ async def main():
             browser=os.getenv("TIKTOK_BROWSER", "chromium"),
         )
 
+        posts_count = 0
         for source_type, source_name in sources:
             if len(results) >= max_attempts:
                 break
@@ -366,8 +379,10 @@ async def main():
                                 if decision is None:
                                     return  # queued, exit
                                 if decision == "feasible":
-                                    return
-                                if decision == "rejected":
+                                    posts_count += 1
+                                    if posts_count >= MAX_POSTS_PER_RUN:
+                                        return
+                                elif decision == "rejected":
                                     results.pop()
                                     print("  Rejected, trying next carousel...")
                                 else:
@@ -524,6 +539,40 @@ def _process_with_lock(mode: str) -> Optional[str]:
         return decision
     finally:
         _release_lock()
+
+
+def _wait_for_recipe(workspace: Path, timeout: int = 1000) -> bool:
+    """Poll for recipe.txt. Returns True if found."""
+    recipe_file = workspace / "recipe.txt"
+    path_str = str(recipe_file.resolve())
+    start = time.time()
+    poll_count = 0
+    while time.time() - start < timeout:
+        poll_count += 1
+        if recipe_file.exists() and recipe_file.read_text(encoding="utf-8").strip():
+            _log(f"Found recipe.txt")
+            return True
+        if poll_count <= 3 or poll_count % 15 == 0:
+            print(f"  [poll {poll_count}] Waiting for {path_str}...", flush=True)
+            _log(f"Poll {poll_count}: waiting for {path_str}")
+        time.sleep(2)
+    _log(f"Timeout waiting for recipe.txt")
+    return False
+
+
+def _notify_wait_recipe_and_post():
+    """Notify OpenClaw (recipes), wait for recipe.txt, post to webhook. No decision check."""
+    workspace = _get_workspace()
+    _notify_openclaw("recipes")
+    print("  Waiting for recipe.txt...")
+    if not _wait_for_recipe(workspace):
+        print("  No recipe extracted, posting anyway.", flush=True)
+    if _post_to_webhook("recipes"):
+        print("  Done.")
+    else:
+        path = _save_to_failed_queue()
+        _log(f"Failed to post, saved to queue/{path.name}")
+        print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
 
 
 def _wait_for_decision(workspace: Path, timeout: int = 1000) -> Optional[str]:
