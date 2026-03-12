@@ -13,10 +13,10 @@ COPY server.py scraper.py input.json input_recipes.json ./
 # Create directories the scraper needs
 RUN mkdir -p images queue
 
-EXPOSE 8080
+EXPOSE 9090
 
-ENV SCRAPER_SERVER_PORT=8080
+ENV SCRAPER_SERVER_PORT=9090
 ENV TIKTOK_HEADLESS=true
 
 # --timeout 0 for long-running scrapes (OpenClaw, downloads)
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:8080", "--timeout", "0", "server:app"]
+CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:9090", "--timeout", "0", "server:app"]

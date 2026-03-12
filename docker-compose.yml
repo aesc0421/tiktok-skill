@@ -2,7 +2,7 @@ services:
   tiktok-scraper:
     build: .
     ports:
-      - "8080:8080"
+      - "9090:9090"
     env_file: .env
     # Chromium necesita ipc:host para evitar crashes por memoria
     ipc: host
