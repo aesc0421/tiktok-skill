@@ -1,0 +1,16 @@
+services:
+  tiktok-scraper:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file: .env
+    # Chromium necesita ipc:host para evitar crashes por memoria
+    ipc: host
+    init: true
+    restart: unless-stopped
+    # Persistencia para workspace (OpenClaw) y archivos generados
+    volumes:
+      - scraper-data:/app/workspace
+
+volumes:
+  scraper-data:
