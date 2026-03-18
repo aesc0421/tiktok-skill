@@ -238,7 +238,21 @@ def _parse_tiktok_url(url: str) -> tuple[Optional[str], Optional[str]]:
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
-async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: bool = False):
+def _build_endpoint_payload(carousel: dict) -> dict:
+    author = carousel.get("author") or {}
+    payload = {
+        "id": carousel.get("id"),
+        "caption": carousel.get("caption"),
+        "influencerName": author.get("username") or author.get("nickname"),
+        "photos": carousel.get("photos", []),
+        "text": None,
+        "recipe": None,
+        "result": carousel,
+    }
+    return payload
+
+
+async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: bool = False, include_result: bool = False):
     """Fetch a single carousel from a TikTok URL."""
     username, target_id = _parse_tiktok_url(url)
     if not username or not target_id:
@@ -280,6 +294,8 @@ async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: boo
     print(f"  Carousel: {carousel['id']} from {url}")
     _log(f"Carousel {carousel['id']} scraped (--url mode)")
     if mode == "recipes" and skip_decision:
+        if include_result:
+            return _build_endpoint_payload(carousel)
         # Endpoint flow: get recipe from OpenClaw, post directly (no decision)
         if _is_locked():
             path = _enqueue("recipes")
@@ -298,6 +314,9 @@ async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: boo
         path = _save_to_failed_queue()
         _log(f"Failed to post, saved to queue/{path.name}")
         print(f"  Failed to post, saved to {path} for retry")
+
+    if include_result:
+        return _build_endpoint_payload(carousel)
 
 
 async def main():
