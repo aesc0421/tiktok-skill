@@ -4,6 +4,7 @@ TikTok carousel scraper using TikTokApi.
 Extracts photo/carousel posts (captions, music, images) from profiles.
 """
 import asyncio
+import base64
 import csv
 import json
 import os
@@ -46,7 +47,7 @@ SEEN_IDS_FILE = SCRIPT_DIR / "scraped_ids.csv"
 IMAGES_DIR = SCRIPT_DIR / "images"
 LOCK_FILE = SCRIPT_DIR / "scraper.lock"
 QUEUE_DIR = SCRIPT_DIR / "queue"
-MAX_POSTS_PER_RUN = 2
+MAX_POSTS_PER_RUN = 3
 _last_openclaw_notify_ts: float = 0.0
 
 
@@ -562,9 +563,8 @@ def _notify_wait_and_post(mode: str) -> Optional[str]:
                 workspace, expected_id=expected_id, timeout=total_timeout - t1
             )
     if decision == "feasible":
-        api_name = "recipes API" if mode == "recipes" else "influencer API"
-        print(f"  Feasible! Posting to {api_name}...")
-        if _post_to_webhook(mode):
+        print("  Feasible! Sending TikTok link to backend Slack endpoint...")
+        if _post_feasible_link_to_backend_slack():
             print("  Done.")
         else:
             path = _save_to_failed_queue()
@@ -684,6 +684,69 @@ def _save_to_failed_queue() -> Path:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(carousel, f, indent=2)
     return path
+
+
+def _post_feasible_link_to_backend_slack() -> bool:
+    """POST feasible TikTok link to backend endpoint that sends Slack messages."""
+    url = os.environ.get("BACKEND_SLACK_MESSAGE_URL", "").strip()
+    timeout = int(os.environ.get("BACKEND_SLACK_MESSAGE_TIMEOUT", "60"))
+    basic_auth_user = os.environ.get("BACKEND_SLACK_BASIC_AUTH_USER", "coach@avena.coach")
+    basic_auth_pass = os.environ.get("BACKEND_SLACK_BASIC_AUTH_PASS", "coach")
+    if not url:
+        _log("Backend Slack endpoint: skipped (BACKEND_SLACK_MESSAGE_URL not set in .env)")
+        print("  Backend Slack endpoint: skipped (BACKEND_SLACK_MESSAGE_URL not set in .env)")
+        return False
+    if not OUTPUT_FILE.exists():
+        _log("Backend Slack endpoint: no results_carousels.json to send")
+        print("  No results_carousels.json to send.", file=sys.stderr)
+        return False
+    try:
+        with open(OUTPUT_FILE, encoding="utf-8") as f:
+            carousel = json.load(f)
+        tiktok_url = (carousel.get("link") or "").strip()
+        if not tiktok_url:
+            vid = str(carousel.get("id") or "").strip()
+            username = str((carousel.get("author") or {}).get("username") or "").strip()
+            if vid and username:
+                # Most scraped items here are photo/carousel posts.
+                tiktok_url = f"https://www.tiktok.com/@{username}/photo/{vid}"
+            elif vid:
+                tiktok_url = f"https://www.tiktok.com/@unknown/video/{vid}"
+        if not tiktok_url:
+            _log("Backend Slack endpoint: missing TikTok link in results_carousels.json")
+            print("  Missing TikTok link in results_carousels.json.", file=sys.stderr)
+            return False
+        payload = {
+            "channel": "ideas-influencer-ai",
+            "title": "TikTok feasible idea",
+            "body": tiktok_url,
+        }
+        auth_value = base64.b64encode(f"{basic_auth_user}:{basic_auth_pass}".encode("utf-8")).decode("ascii")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {auth_value}",
+        }
+        if os.environ.get("SKIP_SSL_VERIFY", "").lower() in ("true", "1", "yes"):
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        else:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            _log(f"Posted feasible link to backend Slack endpoint (status {r.status})")
+            print(f"  Posted feasible link to backend Slack endpoint (status {r.status})")
+            return True
+    except Exception as e:
+        _log(f"Failed to POST feasible link to backend Slack endpoint: {e}")
+        print(f"  Failed to POST feasible link: {e}", file=sys.stderr)
+        return False
 
 
 def _post_to_webhook(mode: str = "influencer") -> bool:
