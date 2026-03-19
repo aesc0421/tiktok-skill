@@ -47,6 +47,7 @@ IMAGES_DIR = SCRIPT_DIR / "images"
 LOCK_FILE = SCRIPT_DIR / "scraper.lock"
 QUEUE_DIR = SCRIPT_DIR / "queue"
 MAX_POSTS_PER_RUN = 2
+_last_openclaw_notify_ts: float = 0.0
 
 
 def load_seen_ids() -> set:
@@ -238,7 +239,21 @@ def _parse_tiktok_url(url: str) -> tuple[Optional[str], Optional[str]]:
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
-async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: bool = False):
+def _build_endpoint_payload(carousel: dict) -> dict:
+    author = carousel.get("author") or {}
+    payload = {
+        "id": carousel.get("id"),
+        "caption": carousel.get("caption"),
+        "influencerName": author.get("username") or author.get("nickname"),
+        "photos": carousel.get("photos", []),
+        "text": None,
+        "recipe": None,
+        "result": carousel,
+    }
+    return payload
+
+
+async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: bool = False, include_result: bool = False):
     """Fetch a single carousel from a TikTok URL."""
     username, target_id = _parse_tiktok_url(url)
     if not username or not target_id:
@@ -280,6 +295,8 @@ async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: boo
     print(f"  Carousel: {carousel['id']} from {url}")
     _log(f"Carousel {carousel['id']} scraped (--url mode)")
     if mode == "recipes" and skip_decision:
+        if include_result:
+            return _build_endpoint_payload(carousel)
         # Endpoint flow: get recipe from OpenClaw, post directly (no decision)
         if _is_locked():
             path = _enqueue("recipes")
@@ -298,6 +315,9 @@ async def fetch_single_url(url: str, mode: str = "nutrition", skip_decision: boo
         path = _save_to_failed_queue()
         _log(f"Failed to post, saved to queue/{path.name}")
         print(f"  Failed to post, saved to {path} for retry")
+
+    if include_result:
+        return _build_endpoint_payload(carousel)
 
 
 async def main():
@@ -426,8 +446,23 @@ def _get_workspace() -> Path:
     return Path(p).expanduser() if p else Path.home() / ".openclaw" / "workspace"
 
 
+def _openclaw_notify_cooldown():
+    """Space out hook POSTs — back-to-back notifies (~3s apart) can saturate OpenClaw; 2nd job may never run."""
+    global _last_openclaw_notify_ts
+    gap = float(os.environ.get("OPENCLAW_MIN_GAP_BETWEEN_NOTIFIES_SEC", "30"))
+    if gap <= 0:
+        return
+    elapsed = time.time() - _last_openclaw_notify_ts
+    if _last_openclaw_notify_ts > 0 and elapsed < gap:
+        wait = gap - elapsed
+        print(f"  OpenClaw cooldown {wait:.0f}s (evita saturar hooks seguidos)", flush=True)
+        _log(f"OpenClaw cooldown {wait:.0f}s")
+        time.sleep(wait)
+
+
 def _notify_openclaw(mode: Optional[str] = None):
     """POST to OpenClaw webhook so agent processes results_carousels.json."""
+    global _last_openclaw_notify_ts
     mode = mode or MODE
     url = os.environ.get("OPENCLAW_WEBHOOK_URL", "http://127.0.0.1:18789/hooks/agent")
     token = os.environ.get("OPENCLAW_TOKEN", "")
@@ -436,6 +471,7 @@ def _notify_openclaw(mode: Optional[str] = None):
         _log("OpenClaw: skipped (OPENCLAW_TOKEN not set in .env)")
         print("  OpenClaw: skipped (OPENCLAW_TOKEN not set in .env)")
         return
+    _openclaw_notify_cooldown()
     _log(f"OpenClaw: notifying {url}")
     # OpenClaw agent uses ~/.openclaw/workspace; copy results there so it can find them
     import shutil
@@ -457,15 +493,19 @@ def _notify_openclaw(mode: Optional[str] = None):
         message = "extract-recipe: run extract-recipe skill on results_carousels.json, analyze each image, if viable recipe extract to recipe.txt and write feasible to decision.txt, else write rejected to decision.txt."
     else:
         message = "Follow AGENTS.md: process results_carousels.json, analyze each image in photos[], decide if feasible for nutrition influencer account, write decision to decision.txt."
+    hook_timeout = int(os.environ.get("OPENCLAW_HOOK_TIMEOUT_SECONDS", "900"))
+    payload = {
+        "message": message,
+        "wakeMode": "now",
+        "allowUnsafeExternalContent": True,
+        "name": "TikTok carousel",
+        "timeoutSeconds": hook_timeout,
+    }
     try:
         import urllib.request
         req = urllib.request.Request(
             url,
-            data=json.dumps({
-                "message": message,
-                "wakeMode": "now",
-                "allowUnsafeExternalContent": True,
-            }).encode(),
+            data=json.dumps(payload).encode(),
             headers={
                 "x-openclaw-token": token,
                 "Content-Type": "application/json",
@@ -473,8 +513,9 @@ def _notify_openclaw(mode: Optional[str] = None):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            _log(f"Notified OpenClaw (status {r.status})")
-            print(f"  Notified OpenClaw (status {r.status})")
+            _last_openclaw_notify_ts = time.time()
+            _log(f"Notified OpenClaw (status {r.status}, agent timeout={hook_timeout}s)")
+            print(f"  Notified OpenClaw (status {r.status}, agent timeout={hook_timeout}s)")
     except Exception as e:
         _log(f"OpenClaw notify FAILED: {e}")
         print(f"  Warning: could not notify OpenClaw: {e}", file=sys.stderr)
@@ -497,9 +538,29 @@ def _load_from_queue_item(item_dir: Path):
 def _notify_wait_and_post(mode: str) -> Optional[str]:
     """Notify OpenClaw, wait for decision, post to webhook if feasible. Returns decision."""
     workspace = _get_workspace()
+    expected_id = ""
+    if OUTPUT_FILE.exists():
+        try:
+            with open(OUTPUT_FILE, encoding="utf-8") as f:
+                expected_id = str((json.load(f).get("id") or ""))
+        except Exception:
+            pass
     _notify_openclaw(mode)
     print("  Waiting for agent decision...")
-    decision = _wait_for_decision(workspace)
+    stall_sec = int(os.environ.get("OPENCLAW_STALL_RENOTIFY_SEC", "300"))
+    total_timeout = int(os.environ.get("OPENCLAW_DECISION_TIMEOUT_SEC", "1000"))
+    if stall_sec <= 0:
+        decision = _wait_for_decision(workspace, expected_id=expected_id, timeout=total_timeout)
+    else:
+        t1 = min(stall_sec, total_timeout)
+        decision = _wait_for_decision(workspace, expected_id=expected_id, timeout=t1)
+        if decision is None and t1 < total_timeout:
+            print(f"  Sin decisión en {t1}s — re-notificando OpenClaw…", flush=True)
+            _log("OpenClaw stall renotify")
+            _notify_openclaw(mode)
+            decision = _wait_for_decision(
+                workspace, expected_id=expected_id, timeout=total_timeout - t1
+            )
     if decision == "feasible":
         api_name = "recipes API" if mode == "recipes" else "influencer API"
         print(f"  Feasible! Posting to {api_name}...")
@@ -575,8 +636,8 @@ def _notify_wait_recipe_and_post():
         print(f"  Failed to post, saved to {path} for retry", file=sys.stderr)
 
 
-def _wait_for_decision(workspace: Path, timeout: int = 1000) -> Optional[str]:
-    """Poll for decision.txt. Returns 'feasible', 'rejected', or None."""
+def _wait_for_decision(workspace: Path, timeout: int = 1000, expected_id: str = "") -> Optional[str]:
+    """Poll for decision.txt. Returns 'feasible', 'rejected', or None. Verifies id when queue races."""
     decision_file = workspace / "decision.txt"
     path_str = str(decision_file.resolve())
     start = time.time()
@@ -584,11 +645,25 @@ def _wait_for_decision(workspace: Path, timeout: int = 1000) -> Optional[str]:
     while time.time() - start < timeout:
         poll_count += 1
         if decision_file.exists():
-            decision = decision_file.read_text(encoding="utf-8").strip().lower()
+            raw = decision_file.read_text(encoding="utf-8")
+            decision = raw.strip().lower()
             _log(f"Found decision.txt: {decision[:50]}")
-            if decision.startswith("feasible"):
-                return "feasible"
-            return "rejected"
+            accept = True
+            if expected_id:
+                for line in raw.splitlines():
+                    if line.strip().lower().startswith("id:"):
+                        got_id = line.split(":", 1)[1].strip()
+                        if got_id != expected_id:
+                            _log(f"Ignoring decision for wrong id: got {got_id}, expected {expected_id}")
+                            accept = False
+                        break
+            if accept:
+                if "id:" in decision:
+                    decision = decision.split("id:")[0].strip()
+                if decision.startswith("feasible"):
+                    return "feasible"
+                if decision.startswith("rejected"):
+                    return "rejected"
         if poll_count <= 3 or poll_count % 15 == 0:  # log first 3 and every 30s
             print(f"  [poll {poll_count}] Waiting for {path_str}...", flush=True)
             _log(f"Poll {poll_count}: waiting for {path_str}")

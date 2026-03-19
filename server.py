@@ -32,8 +32,14 @@ def run_scraper(url: str, mode: str = "nutrition", skip_decision: bool = False):
 def _scrape(mode: str, skip_decision: bool = False):
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or request.form.get("url") or request.form.get("text") or "").strip()
+    include_result = data.get("includeResult") is True or str(data.get("includeResult", "")).lower() == "true"
     if not url or "tiktok.com" not in url:
         return jsonify({"text": "Error: send a valid TikTok URL"}), 400
+    if include_result:
+        result = asyncio.run(fetch_single_url(url, mode=mode, skip_decision=skip_decision, include_result=True))
+        if result is None:
+            return jsonify({"text": "Error: could not scrape TikTok URL"}), 422
+        return jsonify(result), 200
     threading.Thread(target=run_scraper, args=(url, mode, skip_decision), daemon=True).start()
     return jsonify({"text": f"Processing: {url}"}), 200
 
