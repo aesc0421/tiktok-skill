@@ -47,7 +47,7 @@ SEEN_IDS_FILE = SCRIPT_DIR / "scraped_ids.csv"
 IMAGES_DIR = SCRIPT_DIR / "images"
 LOCK_FILE = SCRIPT_DIR / "scraper.lock"
 QUEUE_DIR = SCRIPT_DIR / "queue"
-MAX_POSTS_PER_RUN = 3
+MAX_POSTS_PER_RUN = 5
 _last_openclaw_notify_ts: float = 0.0
 
 
