@@ -193,6 +193,85 @@ def _extract_author(author) -> dict:
     }
 
 
+def _stats_int(val) -> Optional[int]:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str):
+        v = val.strip().replace(",", "")
+        if v.isdigit() or (v.startswith("-") and len(v) > 1 and v[1:].isdigit()):
+            return int(v)
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_stat_int(*vals) -> Optional[int]:
+    for v in vals:
+        n = _stats_int(v)
+        if n is not None:
+            return n
+    return None
+
+
+def _extract_stats(data: dict) -> dict:
+    """Normalize TikTok aweme stats/statistics (camelCase/snake_case) into stable keys."""
+    if not isinstance(data, dict):
+        return {}
+    s1 = data.get("stats") or {}
+    s2 = data.get("statistics") or {}
+    if not isinstance(s1, dict):
+        s1 = {}
+    if not isinstance(s2, dict):
+        s2 = {}
+    out = {}
+    likes = _first_stat_int(
+        s1.get("diggCount"),
+        s1.get("digg_count"),
+        s2.get("diggCount"),
+        s2.get("digg_count"),
+    )
+    saves = _first_stat_int(
+        s1.get("collectCount"),
+        s1.get("collect_count"),
+        s2.get("collectCount"),
+        s2.get("collect_count"),
+    )
+    comments = _first_stat_int(
+        s1.get("commentCount"),
+        s1.get("comment_count"),
+        s2.get("commentCount"),
+        s2.get("comment_count"),
+    )
+    shares = _first_stat_int(
+        s1.get("shareCount"),
+        s1.get("share_count"),
+        s2.get("shareCount"),
+        s2.get("share_count"),
+    )
+    plays = _first_stat_int(
+        s1.get("playCount"),
+        s1.get("play_count"),
+        s2.get("playCount"),
+        s2.get("play_count"),
+    )
+    if likes is not None:
+        out["likes"] = likes
+    if saves is not None:
+        out["saves"] = saves
+    if comments is not None:
+        out["comments"] = comments
+    if shares is not None:
+        out["shares"] = shares
+    if plays is not None:
+        out["plays"] = plays
+    return out
+
+
 def extract_carousel(video, full_data=None) -> dict:
     """Extract caption, music, photos, author from carousel post."""
     data = full_data or getattr(video, "as_dict", None) or {}
@@ -229,8 +308,9 @@ def extract_carousel(video, full_data=None) -> dict:
             photos.append({"url": url})
 
     author = _extract_author(data.get("author"))
+    stats = _extract_stats(data)
 
-    return {"id": vid, "caption": caption, "song": song, "photos": photos, "author": author}
+    return {"id": vid, "caption": caption, "song": song, "photos": photos, "author": author, "stats": stats}
 
 
 def _parse_tiktok_url(url: str) -> tuple[Optional[str], Optional[str]]:
@@ -406,6 +486,9 @@ async def main():
                                 elif decision == "rejected":
                                     results.pop()
                                     print("  Rejected, trying next carousel...")
+                                elif decision == "skipped_low_engagement":
+                                    results.pop()
+                                    print("  Skipped (low engagement), trying next carousel...")
                                 else:
                                     return
                     break
@@ -536,16 +619,61 @@ def _load_from_queue_item(item_dir: Path):
         shutil.copytree(src_images, IMAGES_DIR)
 
 
+def _ai_engagement_thresholds() -> tuple[int, int]:
+    try:
+        min_saves = int((os.environ.get("TIKTOK_MIN_SAVES_FOR_AI") or "250").strip() or "250")
+    except ValueError:
+        min_saves = 250
+    try:
+        min_likes = int((os.environ.get("TIKTOK_MIN_LIKES_FOR_AI") or "1000").strip() or "1000")
+    except ValueError:
+        min_likes = 1000
+    return min_saves, min_likes
+
+
+def _carousel_meets_ai_engagement_threshold(carousel: dict) -> bool:
+    min_saves, min_likes = _ai_engagement_thresholds()
+    stats = carousel.get("stats")
+    if not isinstance(stats, dict):
+        stats = {}
+    try:
+        likes = int(stats.get("likes", 0))
+    except (TypeError, ValueError):
+        likes = 0
+    try:
+        saves = int(stats.get("saves", 0))
+    except (TypeError, ValueError):
+        saves = 0
+    return saves >= min_saves or likes >= min_likes
+
+
 def _notify_wait_and_post(mode: str) -> Optional[str]:
     """Notify OpenClaw, wait for decision, post to webhook if feasible. Returns decision."""
     workspace = _get_workspace()
     expected_id = ""
+    carousel_loaded: Optional[dict] = None
     if OUTPUT_FILE.exists():
         try:
             with open(OUTPUT_FILE, encoding="utf-8") as f:
-                expected_id = str((json.load(f).get("id") or ""))
+                raw = json.load(f)
+                if isinstance(raw, dict):
+                    carousel_loaded = raw
+                    expected_id = str(raw.get("id") or "")
         except Exception:
             pass
+    if mode != "recipes" and carousel_loaded is not None:
+        if not _carousel_meets_ai_engagement_threshold(carousel_loaded):
+            stats = carousel_loaded.get("stats") if isinstance(carousel_loaded.get("stats"), dict) else {}
+            likes = stats.get("likes", 0)
+            saves = stats.get("saves", 0)
+            min_saves, min_likes = _ai_engagement_thresholds()
+            print(
+                f"  Skip AI (influencer): below engagement (likes={likes}, saves={saves}; "
+                f"need saves>={min_saves} or likes>={min_likes}).",
+                flush=True,
+            )
+            _log(f"Skip AI engagement: likes={likes} saves={saves}")
+            return "skipped_low_engagement"
     _notify_openclaw(mode)
     print("  Waiting for agent decision...")
     stall_sec = int(os.environ.get("OPENCLAW_STALL_RENOTIFY_SEC", "300"))
@@ -779,6 +907,7 @@ def _post_to_webhook(mode: str = "influencer") -> bool:
             "caption": carousel.get("caption", ""),
             "influencerName": influencer_name,
             "photos": [{"url": p.get("url", "")} for p in carousel.get("photos", [])],
+            "stats": carousel.get("stats") or {},
         }
         if mode == "recipes":
             workspace = _get_workspace()
